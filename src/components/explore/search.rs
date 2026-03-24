@@ -22,10 +22,131 @@ pub struct SearchEntry {
     pub schema: String,
     pub table: Option<String>,
     pub is_view: bool,
-    /// Pre-computed lowercased fields for search (avoids per-keystroke allocation)
-    db_lower: String,
-    schema_lower: String,
-    table_lower: Option<String>,
+    /// Pre-computed uppercased fields for fuzzy scoring (avoids per-keystroke allocation)
+    db_upper: String,
+    schema_upper: String,
+    table_upper: Option<String>,
+    /// Full dot-qualified name for plain-query matching, e.g. "DB.SCHEMA.TABLE"
+    qualified_upper: String,
+}
+
+/// Attempt a greedy subsequence scan of `query` through `target` starting at `start`.
+/// Both slices should be uppercased ASCII. Returns a score or None.
+///
+/// Scoring mirrors the Lua fuzzy.lua:
+///   +1 per matched char
+///   +3 if match is at position 0 of target (prefix bonus)
+///   +2 if match is after `_` (word boundary bonus, mutually exclusive with prefix)
+///   +2 if match is consecutive with the previous match
+fn attempt_from(query: &[u8], target: &[u8], start: usize) -> Option<i32> {
+    let qlen = query.len();
+    let tlen = target.len();
+    let mut qi = 0usize;
+    let mut prev_ti: Option<usize> = None;
+    let mut score = 0i32;
+    let mut ti = start;
+
+    while ti < tlen {
+        if qi >= qlen {
+            break;
+        }
+        // Early exit: more query chars left than target chars remaining
+        if (qlen - qi) > (tlen - ti) {
+            return None;
+        }
+        if target[ti] == query[qi] {
+            score += 1;
+            if ti == 0 {
+                score += 3; // prefix bonus
+            } else if matches!(target[ti - 1], b'_' | b'.') {
+                score += 2; // word boundary bonus (after _ or .)
+            }
+            if prev_ti.is_some_and(|p| p + 1 == ti) {
+                score += 2; // consecutive bonus
+            }
+            prev_ti = Some(ti);
+            qi += 1;
+        }
+        ti += 1;
+    }
+
+    if qi >= qlen { Some(score) } else { None }
+}
+
+/// Fuzzy subsequence score. Returns the best score across all starting positions, or None.
+fn subseq_score(query: &[u8], target: &[u8]) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let qlen = query.len();
+    let tlen = target.len();
+    if qlen > tlen {
+        return None;
+    }
+    let q0 = query[0];
+    let mut best: Option<i32> = None;
+    for start in 0..=(tlen - qlen) {
+        if target[start] == q0 {
+            if let Some(s) = attempt_from(query, target, start) {
+                best = Some(best.map_or(s, |b: i32| b.max(s)));
+            }
+        }
+    }
+    best
+}
+
+/// Score a query against a `SearchEntry`. Returns None if no match.
+///
+/// Dot-segmented queries (e.g. "mydb.mysch") split on `.` and match each segment
+/// positionally against db / schema / table. A plain query matches any component
+/// and returns the best score.
+fn fuzzy_score(query: &str, entry: &SearchEntry) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+
+    let query_upper = query.to_uppercase();
+
+    if query_upper.contains('.') {
+        // Dot-segmented: match each segment against the corresponding component
+        let segs: Vec<&[u8]> = query_upper.split('.').map(str::as_bytes).collect();
+        let num_segs = segs.len();
+
+        // Build the ordered list of components present in this entry
+        let components: Vec<&[u8]> = {
+            let mut c: Vec<&[u8]> = vec![entry.db_upper.as_bytes()];
+            if !entry.schema_upper.is_empty() {
+                c.push(entry.schema_upper.as_bytes());
+            }
+            if let Some(ref t) = entry.table_upper {
+                c.push(t.as_bytes());
+            }
+            c
+        };
+
+        if num_segs > components.len() {
+            return None;
+        }
+
+        let mut total = 0i32;
+        for (i, seg) in segs.iter().enumerate() {
+            if seg.is_empty() {
+                continue; // trailing dot — don't require a match on the next segment yet
+            }
+            match subseq_score(seg, components[i]) {
+                Some(s) => total += s,
+                None => return None,
+            }
+        }
+        return Some(total);
+    }
+
+    // Plain query: score against the full qualified name "DB.SCHEMA.TABLE"
+    // so patterns can span component boundaries (e.g. "tpccat" matches
+    // "TPCDS_SF100.CATALOG_SALES"). The '.' separators also act as word
+    // boundaries, so the first char of each component gets a bonus.
+    let qb = query_upper.as_bytes();
+    subseq_score(qb, entry.qualified_upper.as_bytes())
 }
 
 pub struct FuzzySearch {
@@ -76,27 +197,34 @@ impl FuzzySearch {
         self.entries.clear();
 
         for db in databases {
+            let db_upper = db.name.to_uppercase();
+            let qualified_upper = db_upper.clone();
             self.entries.push(SearchEntry {
                 display: db.name.clone(),
-                db_lower: db.name.to_lowercase(),
+                db_upper,
                 db: db.name.clone(),
                 schema: String::new(),
-                schema_lower: String::new(),
+                schema_upper: String::new(),
                 table: None,
-                table_lower: None,
+                table_upper: None,
+                qualified_upper,
                 is_view: false,
             });
         }
 
         for schema in schemas {
+            let db_upper = schema.database.to_uppercase();
+            let schema_upper = schema.name.to_uppercase();
+            let qualified_upper = format!("{db_upper}.{schema_upper}");
             self.entries.push(SearchEntry {
                 display: format!("{} / {}", schema.database, schema.name),
-                db_lower: schema.database.to_lowercase(),
+                db_upper,
                 db: schema.database.clone(),
-                schema_lower: schema.name.to_lowercase(),
+                schema_upper,
                 schema: schema.name.clone(),
                 table: None,
-                table_lower: None,
+                table_upper: None,
+                qualified_upper,
                 is_view: false,
             });
         }
@@ -104,17 +232,22 @@ impl FuzzySearch {
         for table in tables {
             let is_view = table.kind.to_uppercase() == "VIEW";
             let suffix = if is_view { " (V)" } else { "" };
+            let db_upper = table.database.to_uppercase();
+            let schema_upper = table.schema.to_uppercase();
+            let table_upper = table.name.to_uppercase();
+            let qualified_upper = format!("{db_upper}.{schema_upper}.{table_upper}");
             self.entries.push(SearchEntry {
                 display: format!(
                     "{} / {} / {}{}",
                     table.database, table.schema, table.name, suffix
                 ),
-                db_lower: table.database.to_lowercase(),
+                db_upper,
                 db: table.database.clone(),
-                schema_lower: table.schema.to_lowercase(),
+                schema_upper,
                 schema: table.schema.clone(),
-                table_lower: Some(table.name.to_lowercase()),
+                table_upper: Some(table_upper),
                 table: Some(table.name.clone()),
+                qualified_upper,
                 is_view,
             });
         }
@@ -122,36 +255,29 @@ impl FuzzySearch {
         self.results = (0..self.entries.len()).collect();
     }
 
-    /// Substring match: check if query appears as a contiguous substring in the entry's
-    /// display name, table name, schema name, or database name
-    fn substring_match(query: &str, entry: &SearchEntry) -> bool {
-        if query.is_empty() {
-            return true;
-        }
-        let query_lower = query.to_lowercase();
-        // Check against pre-computed lowercased components
-        if entry.db_lower.contains(&query_lower) {
-            return true;
-        }
-        if !entry.schema_lower.is_empty() && entry.schema_lower.contains(&query_lower) {
-            return true;
-        }
-        if let Some(ref table_lower) = entry.table_lower
-            && table_lower.contains(&query_lower)
-        {
-            return true;
-        }
-        false
-    }
-
     fn update_results(&mut self) {
-        self.results = self
+        let query = self.input.clone();
+        if query.is_empty() {
+            self.results = (0..self.entries.len()).collect();
+            self.selected = 0;
+            self.scroll_offset = 0;
+            return;
+        }
+
+        let mut scored: Vec<(i32, usize)> = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| Self::substring_match(&self.input, entry))
-            .map(|(i, _)| i)
+            .filter_map(|(i, entry)| fuzzy_score(&query, entry).map(|s| (s, i)))
             .collect();
+
+        // Sort by score descending, then by display length ascending (shorter = more specific)
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| self.entries[a.1].display.len().cmp(&self.entries[b.1].display.len()))
+        });
+
+        self.results = scored.into_iter().map(|(_, i)| i).collect();
         self.selected = 0;
         self.scroll_offset = 0;
     }
