@@ -20,7 +20,7 @@ pub fn detect_column_type(result: &QueryResult, col_index: usize) -> ColumnType 
             }
             non_null_count += 1;
 
-            if val.is_number() {
+            if val.is_number() || val.as_str().is_some_and(|s| s.parse::<f64>().is_ok()) {
                 numeric_count += 1;
             } else if let Some(s) = val.as_str()
                 && try_parse_date(s).is_some()
@@ -162,13 +162,13 @@ pub fn prepare(result: &QueryResult, config: &ChartConfig) -> Result<PreparedCha
         // For HorizontalBar with categorical Y: Y column = category labels, X column = numeric values
         let (x_value, y_value) = if is_hbar_categorical {
             let category = format_value(y_val_raw);
-            let Some(numeric) = x_val_raw.as_f64() else {
+            let Some(numeric) = x_val_raw.as_f64().or_else(|| x_val_raw.as_str().and_then(|s| s.parse().ok())) else {
                 continue;
             };
             (XValue::Categorical(category), numeric)
         } else {
             let x_value = parse_x_value(x_val_raw, x_type);
-            let Some(y_value) = y_val_raw.as_f64() else {
+            let Some(y_value) = y_val_raw.as_f64().or_else(|| y_val_raw.as_str().and_then(|s| s.parse().ok())) else {
                 continue;
             };
             (x_value, y_value)
@@ -248,7 +248,11 @@ pub fn prepare(result: &QueryResult, config: &ChartConfig) -> Result<PreparedCha
 
 fn parse_x_value(val: &serde_json::Value, col_type: ColumnType) -> XValue {
     match col_type {
-        ColumnType::Numeric => XValue::Numeric(val.as_f64().unwrap_or(0.0)),
+        ColumnType::Numeric => XValue::Numeric(
+            val.as_f64()
+                .or_else(|| val.as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(0.0),
+        ),
         ColumnType::Date => {
             if let Some(s) = val.as_str()
                 && let Some(ms) = try_parse_date(s)
